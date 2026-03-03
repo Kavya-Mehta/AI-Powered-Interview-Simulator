@@ -350,6 +350,32 @@ class InterviewDatabase:
         conn.close()
         return stats
 
+    def get_completed_sessions_with_messages(self, user_id: int, limit: int = 30) -> List[Dict]:
+        """Get completed sessions with messages for dashboard analytics."""
+        conn = self.get_connection()
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        cursor.execute("""
+            SELECT session_id, interview_type, difficulty, started_at, completed_at
+            FROM interview_sessions
+            WHERE user_id = %s AND status = 'completed'
+            ORDER BY completed_at DESC NULLS LAST, started_at DESC
+            LIMIT %s
+        """, (user_id, limit))
+        sessions = [dict(row) for row in cursor.fetchall()]
+
+        for session in sessions:
+            cursor.execute("""
+                SELECT role, content, timestamp
+                FROM chat_messages
+                WHERE session_id = %s
+                ORDER BY timestamp ASC
+            """, (session["session_id"],))
+            session["messages"] = [dict(row) for row in cursor.fetchall()]
+
+        cursor.close()
+        conn.close()
+        return sessions
+
     # ─── Resume Management ─────────────────────────────────────────────────
 
     def upload_resume(self, user_id: int, filename: str, content: str) -> tuple:

@@ -73,8 +73,11 @@ export const getSessionDetails = (session_id) =>
 
 export const getStats = () => API.get("/history/stats");
 
+export const getDashboardInsights = () => API.get("/history/dashboard");
+
 // ─── Resumes ───────────────────────────────────────────────────────────────────
-export const getResume = (resume_id) => API.get(`/profile/resumes/${resume_id}`);
+export const getResume = (resume_id) =>
+  API.get(`/profile/resumes/${resume_id}`);
 
 export const getResumes = () => API.get("/profile/resumes");
 

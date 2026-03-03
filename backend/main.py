@@ -6,6 +6,7 @@ from openai import OpenAI
 from database import InterviewDatabase
 from dotenv import load_dotenv
 import os
+import re
 import jwt
 import datetime
 
@@ -118,10 +119,23 @@ def start_interview(req: StartSessionRequest, user=Depends(verify_token)):
 
 @app.post("/interview/chat")
 def chat(req: ChatRequest, user=Depends(verify_token)):
+    # Save the latest user message if present
+    if req.messages and req.messages[-1]["role"] == "user":
+        db.save_message(req.session_id, "user", req.messages[-1]["content"])
+    
     response = client.chat.completions.create(model="gpt-4o", messages=req.messages)
     ai_reply = response.choices[0].message.content
     db.save_message(req.session_id, "assistant", ai_reply)
-    is_complete = "thank you" in ai_reply.lower() and "overall" in ai_reply.lower()
+    
+    # Check for completion: contains evaluation keywords OR message count suggests final eval
+    reply_lower = ai_reply.lower()
+    eval_keywords = ["evaluation", "overall", "assessment", "final feedback", "feedback", "summary", "conclusion"]
+    has_eval_keyword = any(kw in reply_lower for kw in eval_keywords)
+    
+    # Also check if we've collected enough messages (user answers)
+    user_message_count = sum(1 for msg in req.messages if msg["role"] == "user")
+    is_complete = has_eval_keyword or user_message_count >= req.num_questions
+    
     if is_complete:
         db.update_session_status(req.session_id, "completed")
     return {"message": ai_reply, "completed": is_complete}
@@ -135,6 +149,98 @@ def save_user_message(session_id: int, content: str, user=Depends(verify_token))
 def update_status(session_id: int, req: UpdateStatusRequest, user=Depends(verify_token)):
     db.update_session_status(session_id, req.status)
     return {"success": True}
+
+AREA_CONFIG = [
+    {
+        "name": "LeetCode",
+        "keywords": ["algorithm", "data structure", "complexity", "coding", "code", "leetcode", "optimization", "edge case", "runtime", "bug"],
+        "recommendation": "Practice 3–4 timed LeetCode problems per week and explain trade-offs out loud."
+    },
+    {
+        "name": "Behavioral Questions",
+        "keywords": ["behavioral", "star", "example", "impact", "ownership", "collaboration", "leadership", "stakeholder", "conflict"],
+        "recommendation": "Prepare STAR stories for leadership, conflict, and impact with measurable outcomes."
+    },
+    {
+        "name": "System Design",
+        "keywords": ["system design", "scalability", "architecture", "throughput", "latency", "database", "cache", "api", "distributed"],
+        "recommendation": "Solve one system-design prompt weekly and practice discussing bottlenecks + scaling."
+    },
+    {
+        "name": "Communication",
+        "keywords": ["communicat", "clarity", "explain", "structure", "concise", "articulate", "justify"],
+        "recommendation": "Answer in a structured flow: assumptions → approach → trade-offs → conclusion."
+    },
+    {
+        "name": "Problem Solving",
+        "keywords": ["approach", "problem solving", "break down", "reasoning", "hypothesis", "debug", "strategy"],
+        "recommendation": "Spend 5 minutes framing your approach before coding and verify with small test cases."
+    },
+]
+
+POSITIVE_WORDS = ["strong", "good", "great", "clear", "excellent", "solid", "well", "effective", "confident"]
+NEGATIVE_WORDS = ["improve", "weak", "lacking", "struggle", "unclear", "missed", "incorrect", "incomplete", "needs work"]
+
+
+def _normalize(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "").lower()).strip()
+
+
+def _area_score(text: str, keywords: list[str]) -> int:
+    keyword_hits = sum(text.count(k) for k in keywords)
+    positive_hits = sum(text.count(w) for w in POSITIVE_WORDS)
+    negative_hits = sum(text.count(w) for w in NEGATIVE_WORDS)
+    score = 45 + min(keyword_hits, 10) * 4 + min(positive_hits, 8) * 2 - min(negative_hits, 8) * 3
+    return max(20, min(95, score))
+
+
+def build_dashboard_payload(completed_sessions: list[dict]) -> dict:
+    if not completed_sessions:
+        return {
+            "has_data": False,
+            "areas": [{"name": cfg["name"], "score": 0} for cfg in AREA_CONFIG],
+            "strengths": [],
+            "improvements": [],
+            "recommendations": [],
+            "summary": "Complete an interview to unlock personalized review and recommendations.",
+            "source_sessions": 0,
+        }
+
+    assistant_text_chunks = []
+    for session in completed_sessions:
+        for message in session.get("messages", []):
+            if message.get("role") == "assistant":
+                assistant_text_chunks.append(message.get("content", ""))
+
+    corpus = _normalize("\n".join(assistant_text_chunks))
+    areas = [{"name": cfg["name"], "score": _area_score(corpus, cfg["keywords"])} for cfg in AREA_CONFIG]
+    ranked = sorted(areas, key=lambda a: a["score"], reverse=True)
+
+    top_areas = ranked[:2]
+    low_areas = list(reversed(ranked[-2:]))
+
+    rec_map = {cfg["name"]: cfg["recommendation"] for cfg in AREA_CONFIG}
+    recommendations = [rec_map[a["name"]] for a in low_areas]
+
+    strengths = [f"{a['name']} ({a['score']}/100)" for a in top_areas]
+    improvements = [f"{a['name']} ({a['score']}/100)" for a in low_areas]
+
+    summary = (
+        f"Based on your last {len(completed_sessions)} completed interview"
+        f"{'s' if len(completed_sessions) > 1 else ''}, your strongest area is {top_areas[0]['name']}. "
+        f"Focus next on {low_areas[0]['name']} to improve overall interview performance."
+    )
+
+    return {
+        "has_data": True,
+        "areas": areas,
+        "strengths": strengths,
+        "improvements": improvements,
+        "recommendations": recommendations,
+        "summary": summary,
+        "source_sessions": len(completed_sessions),
+    }
+
 
 # ─── History Routes ────────────────────────────────────────────────────────────
 @app.get("/history/sessions")
@@ -163,6 +269,19 @@ def get_session_details(session_id: int, user=Depends(verify_token)):
 @app.get("/history/stats")
 def get_stats(user=Depends(verify_token)):
     return db.get_user_stats(user["user_id"])
+
+@app.get("/history/dashboard")
+def get_dashboard(user=Depends(verify_token)):
+    completed = db.get_completed_sessions_with_messages(user["user_id"], limit=30)
+    # Convert any datetime objects to ISO format
+    for session in completed:
+        for key in ["started_at", "completed_at"]:
+            if key in session and hasattr(session[key], "isoformat"):
+                session[key] = session[key].isoformat()
+        for msg in session.get("messages", []):
+            if "timestamp" in msg and hasattr(msg["timestamp"], "isoformat"):
+                msg["timestamp"] = msg["timestamp"].isoformat()
+    return build_dashboard_payload(completed)
 
 # ─── Profile Routes ────────────────────────────────────────────────────────────
 @app.get("/profile")

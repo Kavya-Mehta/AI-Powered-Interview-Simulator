@@ -14,6 +14,7 @@ export default function Layout({ children }) {
   const navLinks = [
     { path: "/", label: "Interview" },
     { path: "/history", label: "History" },
+    { path: "/results", label: "Results" },
   ];
 
   return (
@@ -21,7 +22,6 @@ export default function Layout({ children }) {
       {/* ─── Sticky Top Navigation ─── */}
       <header className="sticky top-0 z-50 bg-[#fdf8f3]/95 backdrop-blur-sm border-b border-[#e8ddd3]">
         <nav className="max-w-7xl mx-auto px-6 h-16 flex items-center justify-between gap-8">
-          
           {/* Logo */}
           <button
             onClick={() => navigate("/")}
@@ -87,9 +87,7 @@ export default function Layout({ children }) {
       </header>
 
       {/* ─── Page Content ─── */}
-      <main className="flex-1">
-        {children}
-      </main>
+      <main className="flex-1">{children}</main>
     </div>
   );
 }
