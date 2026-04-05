@@ -2,8 +2,9 @@ from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from pydantic import BaseModel
-from openai import OpenAI
+from pydantic import BaseModel, Field
+from langchain_openai import ChatOpenAI
+from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 from database import InterviewDatabase
 from dotenv import load_dotenv
 import os
@@ -28,10 +29,10 @@ async def global_exception_handler(request: Request, exc: Exception):
     )
 
 try:
-    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    llm = ChatOpenAI(model="gpt-4o", api_key=os.getenv("OPENAI_API_KEY"))
 except Exception as e:
-    print(f"CRITICAL: Failed to initialize OpenAI: {e}")
-    client = None
+    print(f"CRITICAL: Failed to initialize ChatOpenAI: {e}")
+    llm = None
 
 try:
     db = InterviewDatabase()
@@ -145,9 +146,14 @@ def start_interview(req: StartSessionRequest, user=Depends(verify_token)):
     system_prompt = build_system_prompt(
         req.interview_type, req.difficulty, req.num_questions, req.resume_text, req.job_description
     )
-    messages = [{"role": "system", "content": system_prompt}]
-    response = client.chat.completions.create(model="gpt-4o", messages=messages)
-    ai_msg = response.choices[0].message.content
+    if not llm:
+        raise HTTPException(status_code=500, detail="LLM not initialized properly. Check API keys.")
+    messages = [SystemMessage(content=system_prompt)]
+    response = llm.invoke(messages)
+    ai_msg = response.content
+    
+    dict_messages = [{"role": "system", "content": system_prompt}]
+    
     session_id = db.create_session(
         user["user_id"], req.interview_type, req.difficulty, req.num_questions
     )
@@ -155,17 +161,28 @@ def start_interview(req: StartSessionRequest, user=Depends(verify_token)):
     return {
         "session_id": session_id,
         "message": ai_msg,
-        "messages": messages + [{"role": "assistant", "content": ai_msg}]
+        "messages": dict_messages + [{"role": "assistant", "content": ai_msg}]
     }
 
 @app.post("/interview/chat")
 def chat(req: ChatRequest, user=Depends(verify_token)):
+    if not llm:
+        raise HTTPException(status_code=500, detail="LLM not initialized properly. Check API keys.")
     # Save the latest user message if present
     if req.messages and req.messages[-1]["role"] == "user":
         db.save_message(req.session_id, "user", req.messages[-1]["content"])
     
-    response = client.chat.completions.create(model="gpt-4o", messages=req.messages)
-    ai_reply = response.choices[0].message.content
+    langchain_messages = []
+    for msg in req.messages:
+        if msg["role"] == "system":
+            langchain_messages.append(SystemMessage(content=msg["content"]))
+        elif msg["role"] == "user":
+            langchain_messages.append(HumanMessage(content=msg["content"]))
+        elif msg["role"] == "assistant":
+            langchain_messages.append(AIMessage(content=msg["content"]))
+            
+    response = llm.invoke(langchain_messages)
+    ai_reply = response.content
     db.save_message(req.session_id, "assistant", ai_reply)
     
     # Check for completion: contains evaluation keywords OR message count suggests final eval
@@ -286,9 +303,17 @@ def _area_score(text: str, keywords: list[str]) -> int:
     return max(20, min(95, score))
 
 
+class AreaAnalysis(BaseModel):
+    area: str = Field(description="Exact area name")
+    score: int = Field(description="Performance score 0-100 based on answer quality and feedback")
+    evidence: str = Field(description="Brief explanation of what was tested and how they performed")
+
+class InterviewAnalysis(BaseModel):
+    covered_areas: list[AreaAnalysis] = Field(description="List of areas actually covered in the interview")
+
 def analyze_qa_pairs_with_ai(qa_pairs: list[dict], area_config: list[dict]) -> dict:
     """Use AI to analyze Q&A pairs and determine coverage and performance for each area."""
-    if not qa_pairs:
+    if not qa_pairs or not llm:
         return {}
     
     area_names = [cfg["name"] for cfg in area_config]
@@ -310,42 +335,15 @@ For each area that was ACTUALLY COVERED in the interview questions:
 1. Assign a performance score 0-100 based on answer quality and feedback
 2. Note specific strengths or weaknesses
 
-Respond in this exact JSON format:
-{{
-  "covered_areas": [
-    {{
-      "area": "exact area name",
-      "score": 75,
-      "evidence": "brief explanation of what was tested and how they performed"
-    }}
-  ]
-}}
-
 Only include areas that were actually asked about. If coding wasn't tested, don't include it.
 
 Interview Q&A:
-{qa_text}
-
-JSON Response:"""
+{qa_text}"""
 
     try:
-        response = client.chat.completions.create(
-            model="gpt-4o",
-            messages=[{"role": "user", "content": analysis_prompt}],
-            temperature=0.3,
-            max_tokens=800
-        )
-        
-        result_text = response.choices[0].message.content.strip()
-        # Extract JSON from markdown code blocks if present
-        if "```json" in result_text:
-            result_text = result_text.split("```json")[1].split("```")[0].strip()
-        elif "```" in result_text:
-            result_text = result_text.split("```")[1].split("```")[0].strip()
-        
-        import json
-        analysis = json.loads(result_text)
-        return analysis
+        structured_llm = llm.with_structured_output(InterviewAnalysis)
+        result = structured_llm.invoke([HumanMessage(content=analysis_prompt)])
+        return result.model_dump() if hasattr(result, "model_dump") else result.dict()
     except Exception as e:
         print(f"AI analysis error: {e}")
         return {}

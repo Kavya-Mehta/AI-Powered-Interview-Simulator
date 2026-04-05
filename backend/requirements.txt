@@ -1,6 +1,9 @@
 fastapi
 uvicorn
 openai
+langchain
+langchain-core
+langchain-openai
 python-dotenv
 psycopg2-binary
 pyjwt
