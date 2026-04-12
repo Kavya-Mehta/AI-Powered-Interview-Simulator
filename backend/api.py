@@ -154,6 +154,26 @@ def get_latest_candidate_attempt(messages: list) -> str:
     return ""
 
 
+OFF_TOPIC_KEYWORDS = [
+    # Cooking/recipes
+    r"\brecipe\b", r"\brecipes\b", r"\bcook\b", r"\bcooking\b", r"\bfood\b", r"\bdish\b", r"\bingredient", 
+    # Entertainment/casual
+    r"\bjoke\b", r"\bjokes\b", r"\bfunny\b", r"\bgame\b", r"\bsong\b", r"\bmovie\b", r"\bstory\b",
+    # Non-tech homework
+    r"\bmath\s+homework\b", r"\bhistory\s+essay\b", r"\bphysics\s+problem\b",
+    # Personal/medical/legal
+    r"\bmedical\b", r"\bdoctor\b", r"\blegal\b", r"\blawyer\b", r"\bhealth\b", r"\bdiet\b",
+    # General non-interview
+    r"\bweather\b", r"\bsports\b", r"\bpolitics\b", r"\breligion\b", r"\btranslate\b",
+]
+
+
+def is_off_topic_request(text: str) -> bool:
+    """Detect if the message is about something unrelated to the interview."""
+    normalized = (text or "").strip().lower()
+    return any(re.search(pattern, normalized) for pattern in OFF_TOPIC_KEYWORDS)
+
+
 def build_hint_guardrail_prompt(interview_type: str, difficulty: str, question: str, latest_attempt: str) -> str:
     return f"""You are a strict {difficulty} {interview_type} interviewer.
 
@@ -233,6 +253,12 @@ def chat(req: ChatRequest, user=Depends(verify_token)):
     if req.messages and req.messages[-1]["role"] == "user":
         latest_user_message = req.messages[-1]["content"]
         db.save_message(req.session_id, "user", latest_user_message)
+
+    # OFF-TOPIC GUARD: Reject non-interview requests immediately.
+    if is_off_topic_request(latest_user_message):
+        off_topic_response = "That is off-topic. Let's stay focused on the interview. Please answer the current question or let me know if you need clarification."
+        db.save_message(req.session_id, "assistant", off_topic_response)
+        return {"message": off_topic_response, "completed": False}
 
     # Hard guardrail: if user asks for direct/full answer, force hints-only reply.
     if is_direct_answer_request(latest_user_message):
