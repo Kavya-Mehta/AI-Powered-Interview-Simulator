@@ -136,6 +136,32 @@ def is_direct_answer_request(text: str) -> bool:
     return any(re.search(pattern, normalized) for pattern in ANSWER_REQUEST_PATTERNS)
 
 
+OFF_TOPIC_PATTERNS = [
+    r"\brecipe\b",
+    r"\bcooking\b",
+    r"\bcook\b",
+    r"\bbiryani\b",
+    r"\bfood\b",
+    r"\bdish\b",
+    r"\bjoke\b",
+    r"\bmovie\b",
+    r"\bmusic\b",
+    r"\bsports\b",
+    r"\bweather\b",
+    r"\bpolitics\b",
+    r"\breligion\b",
+    r"\blegal\b",
+    r"\bmedical\b",
+    r"\bhealth\b",
+    r"\btranslate\b",
+]
+
+
+def is_off_topic_request(text: str) -> bool:
+    normalized = (text or "").strip().lower()
+    return any(re.search(pattern, normalized) for pattern in OFF_TOPIC_PATTERNS)
+
+
 def get_latest_interviewer_question(messages: list) -> str:
     for msg in reversed(messages):
         if msg.get("role") == "assistant":
@@ -233,6 +259,12 @@ def chat(req: ChatRequest, user=Depends(verify_token)):
     if req.messages and req.messages[-1]["role"] == "user":
         latest_user_message = req.messages[-1]["content"]
         db.save_message(req.session_id, "user", latest_user_message)
+
+    # Reject off-topic requests immediately so the simulator stays in interview mode.
+    if is_off_topic_request(latest_user_message):
+        off_topic_reply = "That is off-topic. Let's return to the interview. Please answer the current question."
+        db.save_message(req.session_id, "assistant", off_topic_reply)
+        return {"message": off_topic_reply, "completed": False}
 
     # Hard guardrail: if user asks for direct/full answer, force hints-only reply.
     if is_direct_answer_request(latest_user_message):
