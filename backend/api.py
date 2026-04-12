@@ -119,6 +119,66 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
     except jwt.InvalidTokenError:
         raise HTTPException(status_code=401, detail="Invalid token")
 
+ANSWER_REQUEST_PATTERNS = [
+    r"\bgive\s+me\s+the?\s*answer\b",
+    r"\bgive\s+answer\b",
+    r"\bfull\s+answer\b",
+    r"\bfull\s+solution\b",
+    r"\bexact\s+answer\b",
+    r"\bdirect\s+answer\b",
+    r"\bsolve\s+(it|this|that)\s+for\s+me\b",
+    r"\bjust\s+tell\s+me\s+the\s+answer\b",
+]
+
+
+def is_direct_answer_request(text: str) -> bool:
+    normalized = (text or "").strip().lower()
+    return any(re.search(pattern, normalized) for pattern in ANSWER_REQUEST_PATTERNS)
+
+
+def get_latest_interviewer_question(messages: list) -> str:
+    for msg in reversed(messages):
+        if msg.get("role") == "assistant":
+            content = (msg.get("content") or "").strip()
+            if "?" in content:
+                return content
+    return ""
+
+
+def get_latest_candidate_attempt(messages: list) -> str:
+    for msg in reversed(messages):
+        if msg.get("role") == "user":
+            content = (msg.get("content") or "").strip()
+            if content and not is_direct_answer_request(content):
+                return content
+    return ""
+
+
+def build_hint_guardrail_prompt(interview_type: str, difficulty: str, question: str, latest_attempt: str) -> str:
+    return f"""You are a strict {difficulty} {interview_type} interviewer.
+
+The candidate requested a direct/full answer. You must refuse giving final answers and provide hints only.
+
+Mandatory response format:
+1) One-line refusal (polite, firm).
+2) Hint 1 (high-level strategy).
+3) Hint 2 (next concrete step).
+4) Hint 3 (edge case or trade-off to think about).
+5) End with one question asking the candidate to attempt the next step.
+
+Rules:
+- Do NOT provide a complete solution.
+- Do NOT provide full code.
+- Do NOT provide final wording they can copy as an answer.
+- Keep it concise and interview-focused.
+
+Current interview question:
+{question or 'Use the most recent interview question context.'}
+
+Candidate's latest attempt (if any):
+{latest_attempt or 'No meaningful attempt yet.'}
+"""
+
 # ─── Auth Routes ───────────────────────────────────────────────────────────────
 @app.post("/auth/signup")
 def signup(req: AuthRequest):
@@ -168,10 +228,30 @@ def start_interview(req: StartSessionRequest, user=Depends(verify_token)):
 def chat(req: ChatRequest, user=Depends(verify_token)):
     if not llm:
         raise HTTPException(status_code=500, detail="LLM not initialized properly. Check API keys.")
-    # Save the latest user message if present
+
+    latest_user_message = ""
     if req.messages and req.messages[-1]["role"] == "user":
-        db.save_message(req.session_id, "user", req.messages[-1]["content"])
-    
+        latest_user_message = req.messages[-1]["content"]
+        db.save_message(req.session_id, "user", latest_user_message)
+
+    # Hard guardrail: if user asks for direct/full answer, force hints-only reply.
+    if is_direct_answer_request(latest_user_message):
+        latest_question = get_latest_interviewer_question(req.messages[:-1])
+        latest_attempt = get_latest_candidate_attempt(req.messages[:-1])
+        guardrail_prompt = build_hint_guardrail_prompt(
+            req.interview_type,
+            req.difficulty,
+            latest_question,
+            latest_attempt,
+        )
+        hint_response = llm.invoke([
+            SystemMessage(content=guardrail_prompt),
+            HumanMessage(content="Provide hints only for the current interview question."),
+        ])
+        ai_reply = hint_response.content
+        db.save_message(req.session_id, "assistant", ai_reply)
+        return {"message": ai_reply, "completed": False}
+
     langchain_messages = []
     for msg in req.messages:
         if msg["role"] == "system":
@@ -180,20 +260,26 @@ def chat(req: ChatRequest, user=Depends(verify_token)):
             langchain_messages.append(HumanMessage(content=msg["content"]))
         elif msg["role"] == "assistant":
             langchain_messages.append(AIMessage(content=msg["content"]))
-            
+
+    # Always reinforce hint-only behavior during regular turns.
+    langchain_messages.insert(0, SystemMessage(content=(
+        "Enforce hint-only coaching. Never provide full answers, full solutions, or complete code. "
+        "Give progressive hints that build on prior hints and the candidate's latest attempt."
+    )))
+
     response = llm.invoke(langchain_messages)
     ai_reply = response.content
     db.save_message(req.session_id, "assistant", ai_reply)
-    
+
     # Check for completion: contains evaluation keywords OR message count suggests final eval
     reply_lower = ai_reply.lower()
     eval_keywords = ["evaluation", "overall", "assessment", "final feedback", "feedback", "summary", "conclusion"]
     has_eval_keyword = any(kw in reply_lower for kw in eval_keywords)
-    
+
     # Also check if we've collected enough messages (user answers)
     user_message_count = sum(1 for msg in req.messages if msg["role"] == "user")
     is_complete = has_eval_keyword or user_message_count >= req.num_questions
-    
+
     if is_complete:
         db.update_session_status(req.session_id, "completed")
     return {"message": ai_reply, "completed": is_complete}
