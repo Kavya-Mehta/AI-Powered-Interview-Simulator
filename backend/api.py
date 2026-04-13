@@ -154,12 +154,48 @@ OFF_TOPIC_PATTERNS = [
     r"\bmedical\b",
     r"\bhealth\b",
     r"\btranslate\b",
+    r"\blatin\b",
+    r"\bcapital\s+of\b",
+    r"\baustralia\b",
+    r"\bcat\b.*\btree\b",
+    r"\blottery\b",
+    r"\bworkout\b",
+    r"\bdiet\b",
+    r"\bbodybuilder\b",
+    r"\bpolitical\s+joke\b",
+    r"\bsci[-\s]?fi\b",
+    r"\btime[-\s]?travel(ing)?\b",
+    r"\btoaster\b",
+    r"\bpadlock\b",
+    r"\bpick\s+(a\s+)?lock\b",
+    r"\brewire\b",
+    r"\b240v\b",
+    r"\belectrical\s+panel\b",
+    r"\bignore\s+all\s+your\s+previous\s+instructions\b",
 ]
+
+
+INTERVIEW_RELATED_PATTERNS = [
+    r"\binterview\b", r"\bquestion\b", r"\banswer\b", r"\bresume\b", r"\bjob\b", r"\bjd\b",
+    r"\brole\b", r"\bexperience\b", r"\bproject\b", r"\btechnical\b", r"\bbehavioral\b",
+    r"\bapi\b", r"\bdatabase\b", r"\bsystem\s+design\b", r"\barchitecture\b", r"\bscalab\w*\b",
+    r"\balgorithm\b", r"\bdata\b", r"\bpipeline\b", r"\bdebug\b", r"\bperformance\b",
+    r"\bstar\b", r"\bleadership\b", r"\bconflict\b", r"\bimpact\b", r"\btrade[-\s]?off\b",
+]
+
+
+def is_interview_related(text: str) -> bool:
+    normalized = (text or "").strip().lower()
+    return any(re.search(pattern, normalized) for pattern in INTERVIEW_RELATED_PATTERNS)
 
 
 def is_off_topic_request(text: str) -> bool:
     normalized = (text or "").strip().lower()
-    return any(re.search(pattern, normalized) for pattern in OFF_TOPIC_PATTERNS)
+    has_off_topic_signal = any(re.search(pattern, normalized) for pattern in OFF_TOPIC_PATTERNS)
+    if not has_off_topic_signal:
+        return False
+    # If a message is clearly interview-related, do not over-block.
+    return not is_interview_related(normalized)
 
 
 STOPWORDS = {
@@ -357,14 +393,13 @@ def chat(req: ChatRequest, user=Depends(verify_token)):
     ai_reply = response.content
     db.save_message(req.session_id, "assistant", ai_reply)
 
-    # Check for completion: contains evaluation keywords OR message count suggests final eval
+    # Check for completion based on explicit evaluation signal from the interviewer.
     reply_lower = ai_reply.lower()
     eval_keywords = ["evaluation", "overall", "assessment", "final feedback", "feedback", "summary", "conclusion"]
     has_eval_keyword = any(kw in reply_lower for kw in eval_keywords)
 
-    # Also check if we've collected enough messages (user answers)
-    user_message_count = sum(1 for msg in req.messages if msg["role"] == "user")
-    is_complete = has_eval_keyword or user_message_count >= req.num_questions
+    # Do not complete based on raw turn count; follow-up questions can add extra turns.
+    is_complete = has_eval_keyword
 
     if is_complete:
         db.update_session_status(req.session_id, "completed")
@@ -786,6 +821,12 @@ def build_system_prompt(interview_type, difficulty, num_questions, resume_text="
 - If the candidate asks for "the answer", "full solution", or "solve it for me", refuse politely and give hints only.
 - IF the user asks anything unrelated to software engineering or the interview, you MUST reply ONLY with: "That is off-topic. Let's return to the interview." Then ask your next technical question.
 
+### FORMATTING LOCK (MANDATORY)
+- Keep interviewer responses concise and interview-first.
+- Do NOT include company explainer preambles like "Company X is..." unless the candidate explicitly asks for company context.
+- Start with the interview question directly (a short greeting is fine only on the first turn).
+- Avoid long setup paragraphs; ask the question in a direct, role-relevant way.
+
 ### HINT-ONLY POLICY (MANDATORY)
 - Always coach with hints, not final answers.
 - Give 1-3 progressive hints: start high-level, then slightly more specific if needed.
@@ -797,8 +838,10 @@ def build_system_prompt(interview_type, difficulty, num_questions, resume_text="
 
 ### CORE WORKFLOW
 1. Ask ONE question at a time and wait for a response.
-2. Provide 2-3 sentences of constructive feedback in a hint-first style, then ask the next question.
-3. After exactly {num_questions} questions, end the interview and provide a final evaluation.
+2. Provide 2-3 sentences of constructive feedback in a hint-first style.
+3. If the answer is vague, incomplete, or misses key requirements, ask ONE concise follow-up question before moving on.
+4. If the answer is sufficient, move to the next main question.
+5. After exactly {num_questions} main questions, end the interview and provide a final evaluation.
 
 ### INTERVIEW GUIDANCE
 - Technical: Focus purely on coding, systems, and domain knowledge.
